@@ -1,0 +1,41 @@
+spec_version: 1
+name: support-triage-openenv
+type: environment
+version: 0.1.0
+description: |
+  A real-world enterprise support operations environment for billing, security, and privacy triage.
+  Agents must inspect a ticket, research policy, assign structured workflow fields, write a compliant
+  customer reply, and resolve the case while earning dense partial-credit rewards.
+runtime:
+  framework: openenv
+  transport: websocket
+  dockerfile: server/Dockerfile
+app:
+  module: server.app:app
+port: 8000
+models:
+  action: models.SupportTriageAction
+  observation: models.SupportTriageObservation
+  state: models.SupportTriageState
+  reward: models.SupportRewardModel
+tasks:
+  - id: duplicate_charge_easy
+    difficulty: easy
+    description: Resolve a straightforward duplicate-charge refund ticket.
+  - id: refund_outside_window_easy_plus
+    difficulty: easy
+    description: Politely reject a refund that falls outside the policy window.
+  - id: account_takeover_medium
+    difficulty: medium
+    description: Escalate and respond to an urgent account takeover safely.
+  - id: sla_breach_escalation_medium_plus
+    difficulty: medium
+    description: Escalate an enterprise case before the SLA is breached.
+  - id: gdpr_billing_mix_hard
+    difficulty: hard
+    description: Handle a GDPR deletion request mixed with a billing dispute.
+tags:
+  - openenv
+  - support-operations
+  - enterprise-workflows
+  - policy-reasoning

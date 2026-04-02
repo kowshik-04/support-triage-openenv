@@ -1,0 +1,2 @@
+# Placeholder lock file for OpenEnv packaging validation.
+# Generate a fully resolved lock with `UV_CACHE_DIR=.uv-cache uv lock` in a normal local environment.
