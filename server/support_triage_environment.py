@@ -39,6 +39,10 @@ AVAILABLE_ACTIONS = [
 MAX_STEPS = 12
 
 
+def normalize_score(score: float) -> float:
+    return max(0.01, min(0.99, float(score)))
+
+
 @dataclass
 class InternalState:
     task: TicketTask
@@ -274,7 +278,8 @@ class SupportTriageEnvironment(
             observation = self.step(action)
             if observation.done:
                 break
-        return observation.grader_score if actions else self.grade_current_state()[0]
+        final_score = observation.grader_score if actions else self.grade_current_state()[0]
+        return normalize_score(final_score)
 
     def _handle_search_policy(
         self,
@@ -360,6 +365,7 @@ class SupportTriageEnvironment(
     ) -> SupportTriageObservation:
         state = self._require_state()
         score, components, violations = self.grade_current_state()
+        final_score = normalize_score(score)
         return SupportTriageObservation(
             done=state.done,
             reward=reward_model.value,
@@ -391,7 +397,7 @@ class SupportTriageEnvironment(
             completed_actions=[item["action_type"] for item in state.history],
             available_actions=AVAILABLE_ACTIONS,
             guidance=guidance,
-            grader_score=score,
+            grader_score=final_score,
             component_scores=components,
             violations=violations,
         )

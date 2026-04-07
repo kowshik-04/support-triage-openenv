@@ -19,7 +19,6 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN = os.getenv("HF_TOKEN")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-IMAGE_NAME = LOCAL_IMAGE_NAME or os.getenv("IMAGE_NAME", "support-triage-openenv")
 API_KEY = OPENAI_API_KEY or HF_TOKEN
 BENCHMARK = "support-triage-openenv"
 MAX_STEPS = 12
@@ -680,12 +679,12 @@ def get_next_action(
 async def run_task(client: OpenAI, task_name: str) -> float:
     try:
         use_local_llm = "127.0.0.1:11434" in API_BASE_URL or "localhost:11434" in API_BASE_URL
-        if PREFER_INPROCESS or use_local_llm:
+        if PREFER_INPROCESS or use_local_llm or not LOCAL_IMAGE_NAME:
             raise RuntimeError("Using in-process environment for local-model compatibility.")
         if shutil.which("docker") is None:
             raise RuntimeError("Docker CLI is not available.")
         provider = LocalDockerProvider()
-        base_url = provider.start_container(IMAGE_NAME)
+        base_url = provider.start_container(LOCAL_IMAGE_NAME)
         provider.wait_for_ready(base_url)
         env = SupportTriageEnv(
             base_url=base_url,
