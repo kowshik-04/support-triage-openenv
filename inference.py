@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from openenv.core.containers.runtime import LocalDockerProvider
@@ -22,8 +22,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 API_KEY = OPENAI_API_KEY or HF_TOKEN
 BENCHMARK = "support-triage-openenv"
 MAX_STEPS = 12
-PLAN_TEMPERATURE = 0.2
-ACTION_TEMPERATURE = 0.25
+PLAN_TEMPERATURE = float(os.getenv("PLAN_TEMPERATURE", "0.3"))
+ACTION_TEMPERATURE = float(os.getenv("ACTION_TEMPERATURE", "0.6"))
+REFLECTION_TEMPERATURE = float(os.getenv("REFLECTION_TEMPERATURE", "0.2"))
 SUCCESS_SCORE_THRESHOLD = 0.65
 ENV_MESSAGE_TIMEOUT_S = float(os.getenv("ENV_MESSAGE_TIMEOUT_S", "300"))
 PREFER_INPROCESS = os.getenv("OPENENV_PREFER_INPROCESS", "").lower() in {"1", "true", "yes"}
@@ -86,6 +87,17 @@ class TaskProfile:
     description: str
     workflow_hint: str
     fallback_plan: List[Dict[str, str]]
+
+
+@dataclass(frozen=True)
+class AgentDecision:
+    action: Dict[str, str]
+    planned_action: Dict[str, str]
+    planner_note: str
+    executor_note: str
+    critic_note: str
+    confidence: float
+    reasoning: str
 
 
 TASK_PROFILES: Dict[str, TaskProfile] = {
@@ -261,6 +273,14 @@ def _coerce_text_field(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _coerce_confidence(value: Any, default: float = 0.7) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, confidence))
+
+
 def _action_signature(action: Dict[str, str]) -> str:
     return json.dumps(action, sort_keys=True, separators=(",", ":"))
 
@@ -284,8 +304,52 @@ def workflow_status(observation: Dict[str, Any]) -> Dict[str, bool]:
         "priority_set": bool(observation.get("current_priority")),
         "route_set": bool(observation.get("current_route")),
         "tag_exists": len(observation.get("current_tags", [])) > 0,
+        "tags_complete": float(parts.get("tags", 0.0)) >= 0.99,
         "reply_generated": bool(observation.get("latest_reply")),
     }
+
+
+def goal_tracker(observation: Dict[str, Any]) -> Dict[str, Any]:
+    status = workflow_status(observation)
+    parts = observation.get("component_scores", {})
+    completed_actions = observation.get("completed_actions", [])
+    progress = {
+        "research": float(parts.get("research", 0.0)),
+        "classification": float(parts.get("classification", 0.0)),
+        "priority": float(parts.get("priority", 0.0)),
+        "route": float(parts.get("route", 0.0)),
+        "tags": float(parts.get("tags", 0.0)),
+        "reply": float(parts.get("reply", 0.0)),
+        "resolved": float(parts.get("resolved", 0.0)),
+    }
+    return {
+        "status": status,
+        "progress": progress,
+        "completed_action_types": completed_actions,
+        "action_counts": {name: completed_actions.count(name) for name in VALID_ACTION_TYPES},
+    }
+
+
+def task_tradeoff_note(task_id: str) -> str:
+    if "gdpr" in task_id:
+        return "Prioritize privacy and legal compliance over refund speed when there is a conflict."
+    if "sla" in task_id:
+        return "Prioritize urgent ownership and escalation because enterprise SLA risk outweighs generic handling."
+    if "account" in task_id:
+        return "Prioritize account safety and identity verification over convenience."
+    if "refund_outside_window" in task_id:
+        return "Prioritize policy-correct refusal with calm tone instead of making promises."
+    return "Prioritize policy-aligned resolution with clear customer communication."
+
+
+def planner_status_note(observation: Dict[str, Any]) -> str:
+    goals = goal_tracker(observation)
+    missing = summarize_missing_work(observation)
+    return (
+        f"Progress={json.dumps(goals['progress'], sort_keys=True)}; "
+        f"Missing={json.dumps(missing)}; "
+        f"Tradeoff={task_tradeoff_note(observation['task_id'])}"
+    )
 
 
 def validate_action(action: Dict[str, Any], observation: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -326,7 +390,7 @@ def validate_action(action: Dict[str, Any], observation: Dict[str, Any]) -> Opti
         and status["classification_set"]
         and status["priority_set"]
         and status["route_set"]
-        and status["tag_exists"]
+        and status["tags_complete"]
     ):
         return None
 
@@ -342,7 +406,7 @@ def is_ready_to_resolve(observation: Dict[str, Any]) -> bool:
         and status["classification_set"]
         and status["priority_set"]
         and status["route_set"]
-        and status["tag_exists"]
+        and status["tags_complete"]
         and status["reply_generated"]
         and all(float(parts.get(key, 0.0)) >= 0.99 for key in required_keys)
     )
@@ -374,7 +438,7 @@ def fallback_policy(
         for candidate in planned_actions:
             if candidate["action_type"] == "route_ticket":
                 return candidate
-    if not status["tag_exists"]:
+    if not status["tags_complete"]:
         for candidate in planned_actions:
             if candidate["action_type"] == "add_tag" and candidate.get("tag") not in current_tags:
                 return candidate
@@ -414,21 +478,32 @@ def fallback_policy(
 def summarize_missing_work(observation: Dict[str, Any]) -> List[str]:
     status = workflow_status(observation)
     missing: List[str] = []
+    task_id = observation["task_id"]
+    search_count = observation.get("completed_actions", []).count("search_policy")
+    required_searches = len(
+        [item for item in TASK_PROFILES[task_id].fallback_plan if item["action_type"] == "search_policy"]
+    )
 
     if not status["policy_checked"]:
         missing.append("research the relevant policy before making a final decision")
+    elif search_count < required_searches:
+        missing.append("finish the remaining policy checks before closing the case")
     if not status["classification_set"]:
         missing.append("set the correct classification")
     if not status["priority_set"]:
         missing.append("set the correct priority")
     if not status["route_set"]:
         missing.append("route the case to the correct team")
-    if not status["tag_exists"]:
+    if not status["tags_complete"]:
         missing.append("add the required tags")
     if not status["reply_generated"]:
         missing.append("draft a compliant customer reply")
     if not is_ready_to_resolve(observation):
         missing.append("resolve the case only after the workflow is complete")
+    if "gdpr" in task_id and search_count < 2:
+        missing.append("cover both privacy deletion and billing dispute reasoning")
+    if "sla" in task_id and not observation.get("current_priority"):
+        missing.append("mark the enterprise case urgent before responding")
     return missing
 
 
@@ -499,6 +574,13 @@ def forced_reply_action(task_id: str) -> Dict[str, str]:
     }
 
 
+def parse_executor_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], float, str]:
+    raw_action = payload.get("action") if isinstance(payload.get("action"), dict) else payload
+    confidence = _coerce_confidence(payload.get("confidence"), default=0.72)
+    reasoning = _coerce_text_field(payload.get("reasoning")) or "Executor did not provide extra reasoning."
+    return raw_action, confidence, reasoning
+
+
 def _base_system_prompt(task_id: str) -> str:
     profile = TASK_PROFILES[task_id]
     return (
@@ -525,11 +607,14 @@ def generate_plan(client: OpenAI, observation: Dict[str, Any]) -> List[Dict[str,
     fallback_plan = TASK_PROFILES[task_id].fallback_plan
     system_prompt = _base_system_prompt(task_id)
     user_prompt = (
-        "You are an expert support agent. "
+        "You are the planner agent for a support triage system. "
         "Generate a COMPLETE ordered plan to solve this task using ONLY valid actions and allowed enum values. "
         "Follow the workflow: policy -> classification -> priority -> route -> tags -> reply -> resolve. "
+        "Use enough policy lookups to satisfy the task, especially for multi-domain tickets. "
+        f"Decision tradeoff: {task_tradeoff_note(task_id)}. "
         "Return a JSON object with a key 'plan' whose value is an ordered list of actions. "
-        f"Observation: {json.dumps(observation)}."
+        f"Observation: {json.dumps(observation)}. "
+        f"Current planner status: {planner_status_note(observation)}."
     )
     try:
         completion = client.chat.completions.create(
@@ -609,17 +694,63 @@ def adaptive_correction(action: Dict[str, str], observation: Dict[str, Any]) -> 
     return corrected
 
 
-def get_next_action(
+def strategic_reflection(
+    client: OpenAI,
+    observation: Dict[str, Any],
+    plan: List[Dict[str, str]],
+    history: List[str],
+) -> str:
+    task_id = observation["task_id"]
+    system_prompt = _base_system_prompt(task_id)
+    user_prompt = (
+        "You are the reflection agent in a support triage system. "
+        "Review the current trajectory and say whether the agent should stay on the current plan or adjust focus. "
+        "Return a JSON object with keys: adjust_plan (boolean), focus (short string), reasoning (short string). "
+        f"Current observation: {json.dumps(observation)}. "
+        f"Current plan: {json.dumps(plan)}. "
+        f"Recent history: {json.dumps(history[-6:])}. "
+        f"Tradeoff note: {task_tradeoff_note(task_id)}."
+    )
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            temperature=REFLECTION_TEMPERATURE,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        text = (completion.choices[0].message.content or "").strip()
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("Reflection payload is not an object.")
+        focus = _coerce_text_field(payload.get("focus")) or "stay on the highest-value missing workflow step"
+        reasoning = _coerce_text_field(payload.get("reasoning")) or "No reflection reasoning provided."
+        adjust_plan = bool(payload.get("adjust_plan"))
+        prefix = "adjust" if adjust_plan else "stay"
+        return f"{prefix}:{focus}:{reasoning}"
+    except Exception as exc:
+        return f"stay:follow current plan:reflection unavailable ({exc})"
+
+
+def executor_propose_action(
     client: OpenAI,
     observation: Dict[str, Any],
     history: List[str],
     plan: List[Dict[str, str]],
     attempted_signatures: List[str],
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], str, Dict[str, str], float, str]:
     task_id = observation["task_id"]
     status = workflow_status(observation)
     if status["reply_generated"]:
-        return {"action_type": "resolve_ticket"}
+        return (
+            {"action_type": "resolve_ticket"},
+            "Reply already exists, so the executor is ready to close.",
+            {"action_type": "resolve_ticket"},
+            0.98,
+            "Reply has been drafted, so closing the case is the safest next move.",
+        )
 
     system_prompt = _base_system_prompt(task_id)
     planned_action = get_next_step_from_plan(plan, observation, attempted_signatures)
@@ -627,11 +758,13 @@ def get_next_action(
     fallback_action = fallback_policy(observation, plan, attempted_signatures)
     missing_work = summarize_missing_work(observation)
     user_prompt = (
-        "Return exactly one JSON object for the next best action. "
+        "Return exactly one JSON object with keys action, confidence, and reasoning. "
+        "You are the executor agent in a planner/executor/critic triage system. "
         "You are executing a structured plan. "
         "Follow the planned next step but adapt if the observation already satisfies it. "
         "Do not repeat a prior action unless the state clearly still needs it. "
         "Do not choose resolve_ticket unless the case is fully prepared. "
+        f"Decision tradeoff: {task_tradeoff_note(task_id)}. "
         "Briefly reason internally about what is still missing, then output only the JSON action. "
         f"Planned next step: {json.dumps(planned_action)}. "
         f"Remaining plan: {json.dumps(remaining_plan)}. "
@@ -661,19 +794,134 @@ def get_next_action(
             parsed = json.loads(text)
             if not isinstance(parsed, dict):
                 raise ValueError("Action response is not a JSON object.")
-            validated = validate_action(parsed, observation)
+            raw_action, confidence, reasoning = parse_executor_payload(parsed)
+            validated = validate_action(raw_action, observation)
             if validated is None:
                 raise ValueError("Action did not pass validation.")
-            validated = adaptive_correction(validated, observation)
             if _action_signature(validated) in attempted_signatures and attempt == 0:
                 raise ValueError("Repeated already attempted action.")
-            return validated
+            return validated, "Executor proposed a valid next action.", planned_action, confidence, reasoning
         except Exception as exc:
             if attempt == 1:
                 print(f"[DEBUG] Action selection failed twice, using fallback: {exc}", flush=True)
             continue
 
-    return fallback_action
+    return (
+        fallback_action,
+        "Executor fell back to the safest available next step.",
+        planned_action,
+        0.4,
+        "The executor could not produce a valid action, so fallback kept progress moving.",
+    )
+
+
+def critic_review_action(
+    observation: Dict[str, Any],
+    proposed_action: Dict[str, str],
+    planned_action: Dict[str, str],
+    plan: List[Dict[str, str]],
+    attempted_signatures: List[str],
+    history: List[str],
+    executor_confidence: float,
+    executor_reasoning: str,
+) -> AgentDecision:
+    task_id = observation["task_id"]
+    status = workflow_status(observation)
+    completed_actions = observation.get("completed_actions", [])
+    note_parts: List[str] = []
+    corrected = adaptive_correction(dict(proposed_action), observation)
+
+    if status["reply_generated"]:
+        return AgentDecision(
+            action={"action_type": "resolve_ticket"},
+            planned_action=planned_action,
+            planner_note=planner_status_note(observation),
+            executor_note="Workflow already has a reply draft.",
+            critic_note="Critic forced completion because replying should be followed by resolution.",
+            confidence=0.99,
+            reasoning=executor_reasoning,
+        )
+
+    if executor_confidence < 0.6:
+        corrected = planned_action
+        note_parts.append("critic chose the safer planned action because executor confidence was low")
+
+    if corrected["action_type"] == "resolve_ticket" and not status["reply_generated"]:
+        corrected = forced_reply_action(task_id)
+        note_parts.append("critic blocked early resolve and forced a reply")
+
+    if corrected["action_type"] == "search_policy" and status["policy_checked"]:
+        corrected = force_next_missing_step(observation, plan, attempted_signatures)
+        note_parts.append("critic blocked redundant policy search")
+
+    if (
+        corrected["action_type"] in completed_actions
+        and corrected["action_type"] not in {"draft_reply", "resolve_ticket"}
+    ):
+        corrected = force_next_missing_step(observation, plan, attempted_signatures)
+        note_parts.append("critic skipped already completed step")
+
+    if ACTION_ORDER[corrected["action_type"]] > ACTION_ORDER[planned_action["action_type"]]:
+        planned_type = planned_action["action_type"]
+        if planned_type not in completed_actions and planned_type != corrected["action_type"]:
+            corrected = dict(planned_action)
+            note_parts.append("critic restored the planned workflow order")
+
+    if _action_signature(corrected) in attempted_signatures and corrected["action_type"] != "resolve_ticket":
+        corrected = force_next_missing_step(observation, plan, attempted_signatures)
+        note_parts.append("critic avoided a repeated action signature")
+
+    validated = validate_action(corrected, observation)
+    if validated is None:
+        corrected = force_next_missing_step(observation, plan, attempted_signatures)
+        validated = validate_action(corrected, observation) or forced_reply_action(task_id)
+        note_parts.append("critic repaired an invalid action")
+    else:
+        corrected = validated
+
+    if not note_parts:
+        note_parts.append("critic approved the executor proposal")
+
+    return AgentDecision(
+        action=corrected,
+        planned_action=planned_action,
+        planner_note=planner_status_note(observation),
+        executor_note=" ".join(history[-2:]) if history else "No prior execution history yet.",
+        critic_note="; ".join(note_parts),
+        confidence=max(executor_confidence, 0.55 if note_parts else executor_confidence),
+        reasoning=executor_reasoning,
+    )
+
+
+def get_next_action(
+    client: OpenAI,
+    observation: Dict[str, Any],
+    history: List[str],
+    plan: List[Dict[str, str]],
+    attempted_signatures: List[str],
+) -> AgentDecision:
+    proposed_action, executor_note, planned_action, executor_confidence, executor_reasoning = executor_propose_action(
+        client, observation, history, plan, attempted_signatures
+    )
+    decision = critic_review_action(
+        observation=observation,
+        proposed_action=proposed_action,
+        planned_action=planned_action,
+        plan=plan,
+        attempted_signatures=attempted_signatures,
+        history=history,
+        executor_confidence=executor_confidence,
+        executor_reasoning=executor_reasoning,
+    )
+    return AgentDecision(
+        action=decision.action,
+        planned_action=decision.planned_action,
+        planner_note=planner_status_note(observation),
+        executor_note=executor_note,
+        critic_note=decision.critic_note,
+        confidence=decision.confidence,
+        reasoning=decision.reasoning,
+    )
 
 
 async def run_task(client: OpenAI, task_name: str) -> float:
@@ -697,6 +945,7 @@ async def run_task(client: OpenAI, task_name: str) -> float:
         env = InProcessEnvClient()
 
     history: List[str] = []
+    reasoning_memory: List[str] = []
     rewards: List[float] = []
     steps_taken = 0
     final_score = 0.0
@@ -712,18 +961,44 @@ async def run_task(client: OpenAI, task_name: str) -> float:
         plan = generate_plan(client, observation)
         attempted_signatures: List[str] = []
 
+        last_confidence = 1.0
         for step in range(1, MAX_STEPS + 1):
             if _result_done(result):
                 break
 
             observation = _result_observation(result)
+            should_reflect = step > 1 and (step % 3 == 1 or no_progress_steps >= 1 or last_confidence < 0.6)
+            if should_reflect:
+                reflection_note = strategic_reflection(client, observation, plan, history + reasoning_memory[-2:])
+                reasoning_memory.append(f"reflection={reflection_note}")
+                if reflection_note.startswith("adjust:"):
+                    regenerated_plan = generate_plan(client, observation)
+                    if regenerated_plan:
+                        plan = regenerated_plan
             status = workflow_status(observation)
             completed_steps = observation.get("completed_actions", [])
             if status["reply_generated"]:
-                action = {"action_type": "resolve_ticket"}
+                decision = AgentDecision(
+                    action={"action_type": "resolve_ticket"},
+                    planned_action={"action_type": "resolve_ticket"},
+                    planner_note=planner_status_note(observation),
+                    executor_note="Reply already exists, so the executor is closing the case.",
+                    critic_note="Critic approved immediate resolution after reply generation.",
+                    confidence=0.99,
+                    reasoning="Workflow is complete and a reply already exists.",
+                )
             else:
-                action = get_next_action(client, observation, history, plan, attempted_signatures)
-                action = adaptive_correction(action, observation)
+                decision = get_next_action(client, observation, history, plan, attempted_signatures)
+                action = adaptive_correction(decision.action, observation)
+                decision = AgentDecision(
+                    action=action,
+                    planned_action=decision.planned_action,
+                    planner_note=decision.planner_note,
+                    executor_note=decision.executor_note,
+                    critic_note=decision.critic_note,
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                )
 
                 if action["action_type"] == "search_policy" and status["policy_checked"]:
                     action = force_next_missing_step(observation, plan, attempted_signatures)
@@ -749,6 +1024,17 @@ async def run_task(client: OpenAI, task_name: str) -> float:
 
                 if status["reply_generated"] and no_progress_steps >= 1:
                     action = {"action_type": "resolve_ticket"}
+                decision = AgentDecision(
+                    action=action,
+                    planned_action=decision.planned_action,
+                    planner_note=decision.planner_note,
+                    executor_note=decision.executor_note,
+                    critic_note=decision.critic_note,
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                )
+
+            action = decision.action
 
             if (
                 action["action_type"] == "resolve_ticket"
@@ -756,9 +1042,27 @@ async def run_task(client: OpenAI, task_name: str) -> float:
                 and not is_ready_to_resolve(observation)
             ):
                 action = force_next_missing_step(observation, plan, attempted_signatures)
+                decision = AgentDecision(
+                    action=action,
+                    planned_action=decision.planned_action,
+                    planner_note=decision.planner_note,
+                    executor_note=decision.executor_note,
+                    critic_note=f"{decision.critic_note}; outer guard forced the next missing step instead of resolving",
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                )
 
             if attempted_signatures[-2:] == [_action_signature(action), _action_signature(action)]:
                 action = fallback_policy(observation, plan, attempted_signatures)
+                decision = AgentDecision(
+                    action=action,
+                    planned_action=decision.planned_action,
+                    planner_note=decision.planner_note,
+                    executor_note=decision.executor_note,
+                    critic_note=f"{decision.critic_note}; outer guard replaced a repeating action with fallback",
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                )
 
             attempted_signatures.append(_action_signature(action))
             result = await env.step(action)
@@ -773,6 +1077,19 @@ async def run_task(client: OpenAI, task_name: str) -> float:
             log_step(step=step, action=action_str, reward=reward, done=done, error=None)
             history.append(
                 f"step={step} action={action_str} reward={reward:+.2f} score={score:.2f} done={done}"
+            )
+            last_confidence = decision.confidence
+            reasoning_memory.append(
+                " | ".join(
+                    [
+                        f"plan={decision.planned_action.get('action_type', '')}",
+                        f"confidence={decision.confidence:.2f}",
+                        f"planner={decision.planner_note}",
+                        f"executor={decision.executor_note}",
+                        f"critic={decision.critic_note}",
+                        f"reasoning={decision.reasoning}",
+                    ]
+                )
             )
             last_actions.append(action["action_type"])
             if len(last_actions) > 3:

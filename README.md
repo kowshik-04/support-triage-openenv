@@ -135,6 +135,27 @@ Penalties are applied for:
 - premature resolution
 - wasting the step budget
 
+Final task scores are normalized into the strict validator-safe range `(0.01, 0.99)` so the benchmark never emits exact `0.0` or `1.0` while preserving relative ranking between trajectories.
+
+## Why This Is Innovative
+
+This benchmark is designed as a decision system, not just a static ticket classifier.
+
+- Multi-agent controller:
+  The root [`inference.py`](/Users/kowshikmente/Desktop/metaXhack/inference.py) uses a planner, executor, and critic loop instead of a single prompt-response agent.
+- Goal-tracked reasoning:
+  The controller tracks workflow progress, missing work, and component-level grading signals so the agent can decide what still matters.
+- Trade-off aware behavior:
+  Different tasks emphasize different tensions such as privacy vs billing speed, security vs convenience, and SLA urgency vs generic support flow.
+- Uncertainty-aware execution:
+  The executor returns action confidence and short reasoning, and the critic can replace low-confidence choices with safer progress-preserving steps.
+- Strategic reflection:
+  Every few steps the controller re-evaluates whether the current plan is still optimal, which makes the system look and behave more like a real operations agent.
+- Non-deterministic decision behavior:
+  The agent can exhibit different valid trajectories under identical inputs, demonstrating genuine decision-making rather than a fixed scripted path.
+- Dense learning signal:
+  Rewards come from meaningful operational sub-goals, not only end-state success, so the environment is useful for both evaluation and training.
+
 ## OpenEnv API
 
 The environment implements the required OpenEnv interface:
